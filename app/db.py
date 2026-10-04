@@ -307,24 +307,41 @@ def delete_schedule(schedule_id: int) -> bool:
 
 # ---------- 实测核查 ----------
 
-def save_audit(schedule_id: int, records: list[dict], report: dict) -> int:
-    """保存一次实测核查:提交的计划外/实测记录与核查报告原样落库。
+def save_audit(schedule_id: int, records: list[dict], report: dict) -> dict | None:
+    """保存一次实测核查并回读落库记录,两者在同一个事务内完成。
 
-    核查只读取排班保存的快照与 assignment,不改排班本身;排班被删除时
-    其核查报告一并删除。
+    核查只读取排班保存的快照与 assignment,不改排班本身。与删除排班
+    并发时,由两个写事务的提交先后裁决:
+    - 删除先提交:排班已不存在,插入因外键约束失败,返回 None
+      (路由层转成 404),不留下报告;
+    - 本事务先提交:返回本次核查记录;此后排班被删除时报告按
+      ON DELETE CASCADE 一并移除,GET /api/audits/{id} 返回 404。
     """
     with _lock, _conn() as c:
-        cur = c.execute(
-            "INSERT INTO audits (schedule_id, created_at, records, report)"
-            " VALUES (?, ?, ?, ?)",
-            (
-                schedule_id,
-                datetime.now().isoformat(timespec="seconds"),
-                json.dumps(records, ensure_ascii=False),
-                json.dumps(report, ensure_ascii=False),
-            ),
-        )
-        return cur.lastrowid
+        try:
+            cur = c.execute(
+                "INSERT INTO audits (schedule_id, created_at, records, report)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    schedule_id,
+                    datetime.now().isoformat(timespec="seconds"),
+                    json.dumps(records, ensure_ascii=False),
+                    json.dumps(report, ensure_ascii=False),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # 删除排班的写事务已先提交,外键约束拒绝插入
+            return None
+        row = c.execute(
+            "SELECT * FROM audits WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return {
+        "id": row["id"],
+        "schedule_id": row["schedule_id"],
+        "created_at": row["created_at"],
+        "records": json.loads(row["records"]),
+        "report": json.loads(row["report"]),
+    }
 
 
 def get_audit(audit_id: int) -> dict | None:

@@ -199,8 +199,13 @@ def post_audit(schedule_id: int, body: AuditIn) -> dict:
         raise HTTPException(400, str(exc))
 
     report = audit.build_audit_report(sched, records)
-    audit_id = db.save_audit(schedule_id, records, report)
-    return _audit_view(db.get_audit(audit_id))
+    # 保存与回读在同一个事务:若删除排班的写事务先提交,外键约束使
+    # 保存失败并返回 None,按 404 处理且不留下报告;若本事务先提交,
+    # 即使随后排班被删除(报告按级联规则移除),本次仍返回已保存的核查。
+    rec = db.save_audit(schedule_id, records, report)
+    if rec is None:
+        raise HTTPException(404, "排班不存在")
+    return _audit_view(rec)
 
 
 @app.get("/api/audits/{audit_id}")
