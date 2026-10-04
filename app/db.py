@@ -307,13 +307,27 @@ def delete_schedule(schedule_id: int) -> bool:
 
 # ---------- 实测核查 ----------
 
-def save_audit(schedule_id: int, records: list[dict], report: dict) -> int:
-    """保存一次实测核查:提交的计划外/实测记录与核查报告原样落库。
+def save_audit(schedule_id: int, records: list[dict], report: dict) -> dict | None:
+    """在同一个写入事务内完成「排班存在性裁决 → 插入核查 → 回读」。
 
     核查只读取排班保存的快照与 assignment,不改排班本身;排班被删除时
-    其核查报告一并删除。
+    其核查报告随 ON DELETE CASCADE 一并删除。
+
+    与 DELETE /api/schedules/{id} 的并发以本事务相对删除事务的提交先后
+    裁决(全程持有 _lock,两者不可能交错):
+    - 删除先生效:本事务内排班已不存在,返回 None,调用方按 404 处理,
+      不插入、不留存任何核查报告(外键约束也是这一裁决的兜底);
+    - 核查先生效:在同一事务内回读并返回本次核查完整记录;之后删除排班
+      仍按级联规则移除报告。
+    插入与回读处于同一事务,消除「保存成功但回读为空、把 None 当报告」
+    的窗口。
     """
     with _lock, _conn() as c:
+        # 删除先生效时这里读不到排班;_lock 保证本检查与插入对删除原子。
+        if c.execute(
+            "SELECT 1 FROM schedules WHERE id = ?", (schedule_id,)
+        ).fetchone() is None:
+            return None
         cur = c.execute(
             "INSERT INTO audits (schedule_id, created_at, records, report)"
             " VALUES (?, ?, ?, ?)",
@@ -324,7 +338,16 @@ def save_audit(schedule_id: int, records: list[dict], report: dict) -> int:
                 json.dumps(report, ensure_ascii=False),
             ),
         )
-        return cur.lastrowid
+        row = c.execute(
+            "SELECT * FROM audits WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+    return {
+        "id": row["id"],
+        "schedule_id": row["schedule_id"],
+        "created_at": row["created_at"],
+        "records": json.loads(row["records"]),
+        "report": json.loads(row["report"]),
+    }
 
 
 def get_audit(audit_id: int) -> dict | None:
